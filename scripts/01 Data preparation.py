@@ -1,6 +1,7 @@
 from pyprojroot import here
 import polars as pl
 from sklearn.model_selection import train_test_split
+import cv2
 
 # params
 path_raw = here() / "data" / "raw"
@@ -24,5 +25,16 @@ df = df.with_columns(
     .alias("SPLIT")
 )
 
+# img resolution feature
+img_name_ls = df.select("Image Name").to_numpy().flatten().tolist()
+res_ls = [cv2.imread(path_img / i).shape for i in img_name_ls]
+height_ls = [i[0] for i in res_ls]
+width_ls = [i[1] for i in res_ls]
+df = df.with_columns(
+    pl.Series("Height", height_ls),
+    pl.Series("Width", width_ls),
+)
+
 # save
 df.write_csv(path_processed / "labels.csv")
+print("01 Data preparation: Success!")
