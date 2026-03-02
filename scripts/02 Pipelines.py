@@ -3,6 +3,7 @@ from pyprojroot import here
 import polars as pl
 import os
 from tqdm import tqdm
+import numpy as np
 
 # params
 path_raw_img = here() / "data" / "raw" / "Images"
