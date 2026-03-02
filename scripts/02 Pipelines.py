@@ -158,7 +158,7 @@ loc_bright_ls = []
 loc_sobel_ls = []
 loc_vessel_ls = []
 
-for i in img_ls:
+for i in tqdm(img_ls):
     current_img_path = path_raw_img / i
     current_img = cv2.imread(current_img_path)
 
