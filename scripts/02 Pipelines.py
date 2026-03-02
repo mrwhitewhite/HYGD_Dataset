@@ -4,6 +4,8 @@ import polars as pl
 import os
 from tqdm import tqdm
 import numpy as np
+from skimage.filters import frangi
+
 
 # params
 path_raw_img = here() / "data" / "raw" / "Images"
@@ -99,6 +101,7 @@ def od_sobel(img):
 
 def od_vessel(img):
     img_ori = img.copy()
+    kernel_clean_fov_mask = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     kernel_erode_fov_mask = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (101, 101))
     erode_iter = 1
     fov_thres_val = 20
