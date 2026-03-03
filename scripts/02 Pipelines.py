@@ -4,192 +4,256 @@ import polars as pl
 import os
 from tqdm import tqdm
 import numpy as np
-from skimage.filters import frangi
+import matplotlib.pyplot as plt
 
 
 # params
 path_raw_img = here() / "data" / "raw" / "Images"
 path_processed = here() / "data" / "processed"
-path_crop_bright = here() / "data" / "processed" / "od_bright"
-path_crop_sobel = here() / "data" / "processed" / "od_sobel"
-path_crop_vessel = here() / "data" / "processed" / "od_vessel"
+path_processed_crop = here() / "data" / "processed" / "od"
 
 
 # Functions
-def crop_od(img, max_loc, crop_ratio=0.3):
-    img_ori = img.copy()
+class OD:
+    def __init__(self, img):
+        self.img = img
+        self.fov_mask = self.get_fov_mask(img)
+        self.texture_map = self.get_texture_map(img)
+        self.vessel_map = self.get_vessel_map(img)
+        self.spatial_prior = self.get_spatial_prior(self.fov_mask)
+        self.symmetry_map = self.get_symmetry_map(img)
+        self.symmetry_map2 = self.get_symmetry_map2(img)
+        self.vessel_map2 = self.get_vessel_map2(img)
 
-    crop_resize = 512
-    sample_height = img_ori.shape[0]
-    sample_width = img_ori.shape[1]
+        self.od_loc, self.heatmap = self.find_od(
+            [
+                self.texture_map,
+                self.vessel_map,
+                self.vessel_map2,
+                self.symmetry_map,
+                self.symmetry_map2,
+                self.spatial_prior,
+            ]
+        )
 
-    # cropping
-    crop_width = int(sample_width * crop_ratio)
-    crop_height = int(sample_height * crop_ratio)
+    @property
+    def get_od_loc(self):
+        return self.od_loc
 
-    x1 = max(max_loc[0] - crop_width // 2, 0)
-    y1 = max(max_loc[1] - crop_height // 2, 0)
-    x2 = min(max_loc[0] + crop_width // 2, sample_width)
-    y2 = min(max_loc[1] + crop_height // 2, sample_height)
+    def plot(self):
+        plt.figure(figsize=(12, 6))
+        plt.subplot(1, 2, 1)
+        plt.title("Final OD Probability Map")
+        plt.imshow(self.heatmap, cmap="inferno")
+        plt.subplot(1, 2, 2)
+        img_marked = self.mark()
+        plt.title("Detected OD Location")
+        plt.imshow(cv2.cvtColor(img_marked, cv2.COLOR_BGR2RGB))
 
-    cropped_img = img_ori[y1:y2, x1:x2]
-    cropped_resize_img = cv2.resize(cropped_img, (crop_resize, crop_resize))
+    def mark(self, crop_ratio=0.3):
+        out = self.img.copy()
+        h, w = out.shape[:2]
 
-    return cropped_resize_img
+        crop_w = int(w * crop_ratio)
+        crop_h = int(h * crop_ratio)
 
+        x1 = max(self.od_loc[0] - crop_w // 2, 0)
+        y1 = max(self.od_loc[1] - crop_h // 2, 0)
+        x2 = min(self.od_loc[0] + crop_w // 2, w)
+        y2 = min(self.od_loc[1] + crop_h // 2, h)
 
-def od_bright(img):
-    img_ori = img.copy()
+        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 10)
+        cv2.drawMarker(out, self.od_loc, (0, 0, 255), cv2.MARKER_CROSS, 100, 15)
 
-    kernel_clean_fov_mask = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (15, 15)
-    )  # remove random pixel
-    kernel_erode_fov_mask = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (51, 51)
-    )  # erode fov region to avoid halo
-    erode_iter = 10
-    fov_thres_val = 20
-    gaussian_blur_kernel: tuple = (71, 71)
+        return out
 
-    # get fov mask
-    img_gray = cv2.cvtColor(img_ori, cv2.COLOR_BGR2GRAY)
-    _, fov_mask = cv2.threshold(img_gray, fov_thres_val, 255, cv2.THRESH_BINARY)
-    fov_mask = cv2.morphologyEx(fov_mask, cv2.MORPH_ERODE, kernel_clean_fov_mask)
-    fov_mask = cv2.erode(fov_mask, kernel_erode_fov_mask, iterations=erode_iter)
+    def crop_od(self, crop_ratio=0.3):
+        img_ori = self.img.copy()
 
-    # find brightest spot
-    img_red = img_ori[:, :, 2]
-    img_blur = cv2.GaussianBlur(img_red, gaussian_blur_kernel, 0)
-    masked_img = cv2.bitwise_and(img_blur, img_blur, mask=fov_mask)
-    _, _, _, max_loc = cv2.minMaxLoc(masked_img)
-    return max_loc
+        crop_resize = 512
+        sample_height = img_ori.shape[0]
+        sample_width = img_ori.shape[1]
 
+        # cropping
+        crop_width = int(sample_width * crop_ratio)
+        crop_height = int(sample_height * crop_ratio)
 
-def od_sobel(img):
-    img_ori = img.copy()
+        x1 = max(self.od_loc[0] - crop_width // 2, 0)
+        y1 = max(self.od_loc[1] - crop_height // 2, 0)
+        x2 = min(self.od_loc[0] + crop_width // 2, sample_width)
+        y2 = min(self.od_loc[1] + crop_height // 2, sample_height)
 
-    kernel_clean_fov_mask = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (15, 15)
-    )  # remove random pixel
-    kernel_erode_fov_mask = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (51, 51)
-    )  # erode fov region to avoid halo
-    erode_iter = 10
-    fov_thres_val = 20
+        cropped_img = img_ori[y1:y2, x1:x2]
+        cropped_resize_img = cv2.resize(cropped_img, (crop_resize, crop_resize))
 
-    sobel_ksize = 7
-    gaussian_blur_kernel: tuple = (51, 51)
+        return cropped_resize_img
 
-    # get fov mask
-    img_gray = cv2.cvtColor(img_ori, cv2.COLOR_BGR2GRAY)
-    _, fov_mask = cv2.threshold(img_gray, fov_thres_val, 255, cv2.THRESH_BINARY)
-    fov_mask = cv2.morphologyEx(fov_mask, cv2.MORPH_ERODE, kernel_clean_fov_mask)
-    fov_mask = cv2.erode(fov_mask, kernel_erode_fov_mask, iterations=erode_iter)
+    # ===== GET MASK FUNCTIONS =====
+    def get_fov_mask(self, img_input):
+        gray = img_input[:, :, 1]  # Green channel (cleanest boundary)
+        blurred = cv2.medianBlur(gray, 31)
+        circles = cv2.HoughCircles(
+            blurred,
+            cv2.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=1000,  # Assume only ONE big circle exists
+            param1=50,
+            param2=30,
+            minRadius=int(img_input.shape[0] * 0.3),  # At least 30% of image height
+            maxRadius=int(img_input.shape[0] * 0.6),
+        )
+        mask = np.zeros_like(gray)
+        if circles is not None:
+            circles = np.uint16(np.around(circles))
+            for i in circles[0, :]:
+                center = (i[0], i[1])  # x, y
+                radius = i[2]
+                # Draw the detected circle into a binary mask
+                mask = cv2.circle(mask, center, radius, 255, -1)
 
-    # sobel detection
-    gray = cv2.cvtColor(img_ori, cv2.COLOR_BGR2GRAY)
-    grad = cv2.magnitude(
-        cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=sobel_ksize),
-        cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=sobel_ksize),
-    )
-    grad_blur = cv2.GaussianBlur(np.abs(grad), gaussian_blur_kernel, 0)
-    _, _, _, loc_texture = cv2.minMaxLoc(
-        cv2.bitwise_and(np.abs(grad_blur), np.abs(grad_blur), mask=fov_mask)
-    )
-    return loc_texture
+        # erode fov mask
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (51, 51))
+        mask_eroded = cv2.erode(mask, kernel, iterations=3)
+        return mask_eroded
 
+    def get_texture_map(self, img_bgr):
+        red = img_bgr[:, :, 1]
+        red = cv2.medianBlur(red, 15)  # Remove speckle noise
 
-def od_vessel(img):
-    img_ori = img.copy()
-    kernel_clean_fov_mask = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    kernel_erode_fov_mask = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (101, 101))
-    erode_iter = 1
-    fov_thres_val = 20
+        # Structural Gradient (Dilation - Erosion)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        grad = cv2.morphologyEx(red, cv2.MORPH_GRADIENT, kernel)
 
-    gaussian_blur_kernel: tuple = (51, 51)
-    green = img_ori[:, :, 1]
+        # Create a "Hotspot" of density
+        blur_size = int(img_bgr.shape[1] * 0.15)  # 15% of width
+        if blur_size % 2 == 0:
+            blur_size += 1
+        texture_density = cv2.GaussianBlur(grad, (blur_size, blur_size), 0)
 
-    vessels = frangi(
-        green,
-        sigmas=range(2, 30, 4),
-        alpha=0.7,
-        beta=0.5,
-        gamma=0.05,
-        black_ridges=True,
-    )
+        return cv2.normalize(
+            texture_density, None, 0, 1, cv2.NORM_MINMAX, dtype=cv2.CV_32F
+        )
 
-    # get fov mask
-    img_gray = cv2.cvtColor(img_ori, cv2.COLOR_BGR2GRAY)
-    _, fov_mask = cv2.threshold(img_gray, fov_thres_val, 255, cv2.THRESH_BINARY)
+    def get_vessel_map(self, img):
+        green = img[:, :, 1]
+        vessels = cv2.morphologyEx(
+            green,
+            cv2.MORPH_BLACKHAT,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
+        )
+        vessel_density = cv2.GaussianBlur(vessels, (201, 201), 0)
+        vessel_map = cv2.normalize(
+            vessel_density, None, 0, 1, cv2.NORM_MINMAX, dtype=cv2.CV_32F
+        )
+        return vessel_map
 
-    # clean fov mask
-    fov_mask = cv2.morphologyEx(fov_mask, cv2.MORPH_ERODE, kernel_clean_fov_mask)
-    fov_mask = cv2.erode(fov_mask, kernel_erode_fov_mask, iterations=erode_iter)
-    vessels_img = cv2.normalize(vessels, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    vessel_density = cv2.GaussianBlur(vessels_img, gaussian_blur_kernel, 0)
-    masked_vessels = cv2.bitwise_and(vessel_density, vessel_density, mask=fov_mask)
-    _, _, _, loc_vessels = cv2.minMaxLoc(masked_vessels)
+    def get_spatial_prior(self, fov_mask):
+        h, w = fov_mask.shape
+        M = cv2.moments(fov_mask)
+        if M["m00"] != 0:
+            cX = int(M["m10"] / M["m00"])
+            cY = int(M["m01"] / M["m00"])
+        else:
+            cX, cY = w // 2, h // 2
 
-    return loc_vessels
+        x = np.linspace(0, w, w)
+        y = np.linspace(0, h, h)
+        X, Y = np.meshgrid(x, y)
+        sigma = w * 0.15
+        central_valley = 1 - np.exp(-((X - cX) ** 2 + (Y - cY) ** 2) / (2 * sigma**2))
+        prior = central_valley * (fov_mask.astype(np.float32) / 255.0)
 
+        return cv2.normalize(prior, None, 0, 1, cv2.NORM_MINMAX)
 
-# params
-path_raw_img = here() / "data" / "raw" / "Images"
-path_processed = here() / "data" / "processed"
-path_crop_bright = here() / "data" / "processed" / "od_bright"
-path_crop_sobel = here() / "data" / "processed" / "od_sobel"
-path_crop_vessel = here() / "data" / "processed" / "od_vessel"
+    def get_symmetry_map(self, img_bgr):
+        green = img_bgr[:, :, 1]
+        green = cv2.GaussianBlur(green, (7, 7), 0)
+
+        gx = cv2.Sobel(green, cv2.CV_32F, 1, 0, ksize=5)
+        gy = cv2.Sobel(green, cv2.CV_32F, 0, 1, ksize=5)
+        mag, ang = cv2.cartToPolar(gx, gy)
+
+        # Accumulate radial symmetry (simplified for performance)
+        cos_map = cv2.GaussianBlur(np.cos(ang) * mag, (101, 101), 0)
+        sin_map = cv2.GaussianBlur(np.sin(ang) * mag, (101, 101), 0)
+        hub_evidence = cv2.GaussianBlur(mag, (101, 101), 0) - cv2.magnitude(
+            cos_map, sin_map
+        )
+
+        return cv2.normalize(hub_evidence, None, 0, 1, cv2.NORM_MINMAX)
+
+    def get_symmetry_map2(self, img):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        grad = cv2.morphologyEx(
+            gray,
+            cv2.MORPH_GRADIENT,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
+        )
+        texture_expert = cv2.GaussianBlur(grad, (201, 201), 0)
+        texture_expert = cv2.normalize(
+            texture_expert.astype(np.float32), None, 0, 1, cv2.NORM_MINMAX
+        )
+        return texture_expert
+
+    def get_vessel_map2(self, img):
+        green = img[:, :, 1]
+        # Highlight vessels using Black-Hat
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+        vessels = cv2.morphologyEx(green, cv2.MORPH_BLACKHAT, kernel)
+
+        # Calculate symmetry (Directional clash)
+        gx = cv2.Sobel(vessels, cv2.CV_32F, 1, 0, ksize=5)
+        gy = cv2.Sobel(vessels, cv2.CV_32F, 0, 1, ksize=5)
+        mag, ang = cv2.cartToPolar(gx, gy)
+
+        # Vectors cancel out at the hub
+        cos_blur = cv2.GaussianBlur(np.cos(ang) * mag, (201, 201), 0)
+        sin_blur = cv2.GaussianBlur(np.sin(ang) * mag, (201, 201), 0)
+        mag_blur = cv2.GaussianBlur(mag, (201, 201), 0)
+        vessel_expert = cv2.normalize(
+            mag_blur - cv2.magnitude(cos_blur, sin_blur), None, 0, 1, cv2.NORM_MINMAX
+        )
+        return vessel_expert
+
+    def find_od(self, map_ls: list):
+        # FIND OVERLAPPING MAP
+        combined_prob = None
+        for map in map_ls:
+            if combined_prob is None:
+                combined_prob = map
+            else:
+                combined_prob *= map
+
+        final_map = combined_prob
+
+        # LOCATE THE PEAK
+        final_map_8u = cv2.normalize(final_map, None, 0, 255, cv2.NORM_MINMAX).astype(
+            np.uint8
+        )
+        _, _, _, max_loc = cv2.minMaxLoc(final_map_8u)
+
+        return max_loc, final_map_8u
+
 
 df = pl.read_csv(path_processed / "labels.csv")
 img_ls = df.select("Image Name").to_numpy().flatten().tolist()
 
 # create dir, if exist then ignore the error
 try:
-    os.mkdir(path_crop_bright)
-except FileExistsError:
-    pass
-try:
-    os.mkdir(path_crop_sobel)
-except FileExistsError:
-    pass
-try:
-    os.mkdir(path_crop_vessel)
+    os.mkdir(path_processed_crop)
 except FileExistsError:
     pass
 
-
-loc_bright_ls = []
-loc_sobel_ls = []
-loc_vessel_ls = []
-
+# START PROCESSING
+loc_ls = []
 for i in tqdm(img_ls):
     current_img_path = path_raw_img / i
     current_img = cv2.imread(current_img_path)
+    od = OD(current_img)
+    cropped_od = od.crop_od()
+    loc_ls.append(str(od.get_od_loc))
+    cv2.imwrite(str(path_processed_crop / i), cropped_od)
 
-    # find OD loc
-    loc_bright = od_bright(current_img)
-    loc_sobel = od_sobel(current_img)
-    loc_vessel = od_vessel(current_img)
 
-    # crop
-    cropped_bright = crop_od(current_img, loc_bright)
-    cropped_sobel = crop_od(current_img, loc_sobel)
-    cropped_vessel = crop_od(current_img, loc_vessel)
-
-    # save
-    cv2.imwrite(str(path_crop_bright / i), cropped_bright)
-    cv2.imwrite(str(path_crop_sobel / i), cropped_sobel)
-    cv2.imwrite(str(path_crop_vessel / i), cropped_vessel)
-
-    # append to list for df
-    loc_bright_ls.append(str(loc_bright))
-    loc_sobel_ls.append(str(loc_sobel))
-    loc_vessel_ls.append(str(loc_vessel))
-
-# df
-df = df.with_columns(
-    pl.Series("OD_loc_bright", loc_bright_ls),
-    pl.Series("OD_loc_sobel", loc_sobel_ls),
-    pl.Series("OD_loc_vessel", loc_vessel_ls),
-)
+df = df.with_columns(pl.Series("OD_loc", loc_ls))
 df.write_csv(path_processed / "labels_od.csv")
