@@ -32,13 +32,25 @@ class OD:
         return self.od_loc
 
     # ===== MAPPING FUNCTIONS =====
-    def get_fov_mask(self, img_ori):
-        """Generates a mask that suppresses the periphery (Halo Sieve)."""
+    def get_fov_mask(self, img_ori, pad_size=200):
         h, w = img_ori.shape[:2]
-        green = img_ori[:, :, 1]
-        blurred_fov = cv2.medianBlur(green, 31)
 
-        # Hough Circle Detection for FOV
+        # ADD PADDING
+        img_padded = cv2.copyMakeBorder(
+            img_ori,
+            pad_size,
+            pad_size,
+            pad_size,
+            pad_size,
+            cv2.BORDER_CONSTANT,
+            value=[0, 0, 0],
+        )
+
+        # Work on the Green channel of the padded image
+        green_p = img_padded[:, :, 1]
+        blurred_fov = cv2.medianBlur(green_p, 31)
+
+        # DETECT CIRCLE (Hough)
         circles = cv2.HoughCircles(
             blurred_fov,
             cv2.HOUGH_GRADIENT,
@@ -49,19 +61,21 @@ class OD:
             minRadius=int(h * 0.3),
             maxRadius=int(h * 0.6),
         )
-
-        fov_mask = np.zeros_like(green)
+        fov_mask_p = np.zeros_like(green_p)
         if circles is not None:
             circles = np.uint16(np.around(circles))
             i = circles[0, 0]
-            cv2.circle(fov_mask, (i[0], i[1]), i[2], 255, -1)
+            cv2.circle(fov_mask_p, (i[0], i[1]), i[2], 255, -1)
         else:
-            _, fov_mask = cv2.threshold(blurred_fov, 10, 255, cv2.THRESH_BINARY)
+            _, fov_mask_p = cv2.threshold(blurred_fov, 10, 255, cv2.THRESH_BINARY)
 
-        # Large erosion to kill crescent halos at the border
+        # REMOVE HALO
         kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (201, 201))
-        halo_sieve = cv2.erode(fov_mask, kernel_erode, iterations=1)
-        return halo_sieve.astype(np.float32) / 255.0
+        halo_sieve_p = cv2.erode(fov_mask_p, kernel_erode, iterations=1)
+
+        # REMOVE PADDING
+        final_sieve = halo_sieve_p[pad_size : pad_size + h, pad_size : pad_size + w]
+        return final_sieve.astype(np.float32) / 255.0
 
     def get_texture_map(self, img_ori):
         """Uses the Red channel to find high-density gradient hubs."""
