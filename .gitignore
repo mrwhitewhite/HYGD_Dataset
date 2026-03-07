@@ -1,2 +1,6 @@
 data/*
 venv/*
+test.ipynb
+test.md
+outputs/*
+tmp_model/*
