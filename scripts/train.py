@@ -9,6 +9,8 @@ import pandas as pd
 import cv2
 from tqdm import tqdm
 
+import matplotlib.pyplot as plt
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -527,6 +529,58 @@ def train(train_df, val_df, fold=None):
     return model, history
 
 
+def plot_training_curves(history: Dict, tag: str):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    ep = range(1, len(history["train_loss"]) + 1)
+
+    for ax, tr_k, vl_k, title, ylabel in [
+        (axes[0], "train_loss", "val_loss", "Loss", "Loss"),
+        (axes[1], "train_auc", "val_auc", "AUC-ROC", "AUC"),
+    ]:
+        ax.plot(
+            ep,
+            history[tr_k],
+            "o-",
+            label="Train",
+            color="#2196F3",
+            linewidth=2,
+            markersize=4,
+        )
+        ax.plot(
+            ep,
+            history[vl_k],
+            "o-",
+            label="Val",
+            color="#F44336",
+            linewidth=2,
+            markersize=4,
+        )
+
+        # mark best val epoch
+        if "auc" in vl_k:
+            best_ep = int(np.argmax(history[vl_k])) + 1
+            best_v = max(history[vl_k])
+            ax.scatter(
+                [best_ep],
+                [best_v],
+                color="#FF9800",
+                s=120,
+                zorder=5,
+                label=f"Best (ep {best_ep}, {best_v:.4f})",
+            )
+
+        ax.set_title(title, fontweight="bold")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle(f"Training Curves {tag}", fontweight="bold", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(cfg.OUTPUT_DIR / f"training_curves_{tag}.png")
+    plt.show()
+
+
 # ==================== ENTRY POINT ====================
 if __name__ == "__main__":
     print("=" * 60)
@@ -542,6 +596,9 @@ if __name__ == "__main__":
     model, history = train(train_df, val_df)
 
     torch.save(model.state_dict(), cfg.FINAL_OUTPUT_DIR / "final_model.pt")
-    json.dump(history, open(cfg.FINAL_OUTPUT_DIR / "training_history.json", "w"))
+    json.dump(history, open(cfg.OUTPUT_DIR / "training_history.json", "w"))
+
+    # generate plots
+    plot_training_curves(history, tag="final")
 
     print(f"\n[DONE] Model and history saved to {cfg.FINAL_OUTPUT_DIR}/")
