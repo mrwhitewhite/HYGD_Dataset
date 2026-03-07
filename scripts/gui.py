@@ -14,11 +14,6 @@ _ml_error: str = ""
 def _load_ml():
     global _ml_error
     try:
-        import torch
-        import timm
-        import cv2
-        import monai
-
         _ml_ready.set()
     except Exception as e:
         _ml_error = str(e)
@@ -105,7 +100,6 @@ def _make_overlay(image_path: str, saliency: np.ndarray, img_size: int) -> np.nd
 
 
 def _run_inference(image_path: str, model_path: str) -> dict:
-    import torch
     from train import cfg, DEVICE, get_transforms
 
     model = _load_model(model_path, "_cache_single")
