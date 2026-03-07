@@ -55,7 +55,6 @@ warnings.filterwarnings("ignore")
 
 # ==================== CONFIG ====================
 class Config:
-    # ==================== Paths ====================
     PARENTS = here()
     DATA_DIR = PARENTS / Path("data")
     LABELS_CSV = DATA_DIR / "Labels.csv"
@@ -63,14 +62,12 @@ class Config:
     OUTPUT_DIR = PARENTS / Path("outputs")
     FINAL_OUTPUT_DIR = PARENTS / Path("outputs/final")
 
-    # ==================== Dataset ====================
     IMG_SIZE = 380
     LABEL_COL = "Label"
     IMAGE_COL = "Image Name"
     PATIENT_COL = "Patient"
     QUALITY_COL = "Quality Score"
 
-    # ==================== Training Params ====================
     SEED = 42
     BATCH_SIZE = 16
     NUM_WORKERS = 4
@@ -80,23 +77,18 @@ class Config:
     DROPOUT = 0.4
     EARLY_STOP = 8
 
-    # ==================== Augmentation ====================
     USE_MIXUP = True
     MIXUP_ALPHA = 0.2
 
-    # ==================== Model ====================
     BACKBONE = "efficientnet_b3"
     PRETRAINED = True
 
-    # ==================== Inference ====================
     USE_TTA = True
     TTA_STEPS = 5
 
-    # ==================== Classes ====================
     CLASS_NAMES = ["GON-", "GON+"]
     POS_LABEL = "GON+"
 
-    # ==================== MONAI CacheDataset ====================
     CACHE_RATE = 1.0
 
     def __init__(self):
@@ -608,7 +600,6 @@ def plot_confusion_matrix(
     cm = confusion_matrix(labels, preds)
     tn, fp, fn, tp = cm.ravel()
 
-    # row-normalised matrix for colour scale — shows rates not raw counts
     cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
 
     f1 = f1_score(labels, preds, average="macro")
@@ -619,7 +610,7 @@ def plot_confusion_matrix(
     fig, ax = plt.subplots(figsize=(6, 5))
     sns.heatmap(
         cm_norm,
-        annot=False,  # we draw custom annotations below
+        annot=False,
         fmt=".2f",
         cmap="Blues",
         vmin=0.0,
@@ -677,10 +668,10 @@ def visualise_gradcam(model: GlaucomaModel, df: pd.DataFrame):
     _gradients: Dict = {}
 
     def forward_hook(module, input, output):
-        _activations["value"] = output.detach()  # (1, C, H', W')
+        _activations["value"] = output.detach()
 
     def backward_hook(module, grad_in, grad_out):
-        _gradients["value"] = grad_out[0].detach()  # (1, C, H', W')
+        _gradients["value"] = grad_out[0].detach()
 
     fwd_handle = target_layer.register_forward_hook(forward_hook)
     bwd_handle = target_layer.register_full_backward_hook(backward_hook)
@@ -692,21 +683,19 @@ def visualise_gradcam(model: GlaucomaModel, df: pd.DataFrame):
             item = {"image": row["image_path"], "label": int(row["label"])}
             tensor = tfm(item)["image"].unsqueeze(0).to(DEVICE)
 
-            # forward + backward
             model.zero_grad()
             logit = model(tensor)
             logit.backward()
 
-            acts = _activations["value"]  # (1, C, H', W')
-            grads = _gradients["value"]  # (1, C, H', W')
+            acts = _activations["value"]
+            grads = _gradients["value"]
 
-            # Grad-CAM weighting
-            weights = grads.mean(dim=(2, 3), keepdim=True)  # (1, C, 1, 1)
-            cam = (weights * acts).sum(dim=1).squeeze(0)  # (H', W')
+            weights = grads.mean(dim=(2, 3), keepdim=True)
+            cam = (weights * acts).sum(dim=1).squeeze(0)
             cam = torch.clamp(cam, min=0)
             cam -= cam.min()
             cam /= cam.max() + 1e-8
-            saliency = cam.cpu().numpy()  # guaranteed 2-D
+            saliency = cam.cpu().numpy()
 
             prob = float(torch.sigmoid(logit).detach().cpu())
             pred_cls = cfg.CLASS_NAMES[int(prob >= 0.5)]
@@ -777,7 +766,6 @@ if __name__ == "__main__":
 
     plot_training_curves(history, tag="final")
 
-    # ──────────── test set evaluation ────────────
     print("\n[INFERENCE] Running TTA on test set...")
     probs = tta_predict(model, test_df)
     labels = test_df["label"].values
@@ -792,7 +780,6 @@ if __name__ == "__main__":
 
     plot_confusion_matrix(labels, preds, probs, tag="final")
 
-    # ──────────── grad-cam for all test images ────────────
     print("\n[GRAD-CAM] Generating saliency maps for all images...")
     visualise_gradcam(model, df)
 
