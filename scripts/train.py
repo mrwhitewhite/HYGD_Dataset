@@ -10,6 +10,8 @@ import cv2
 from tqdm import tqdm
 
 import matplotlib.pyplot as plt
+import seaborn as sns
+from PIL import Image
 
 import torch
 import torch.nn as nn
@@ -24,6 +26,8 @@ from monai.transforms import (
     EnsureChannelFirstd,
     ScaleIntensityd,
     Resized,
+    Flipd,
+    Rotate90d,
     RandFlipd,
     RandRotate90d,
     RandRotated,
@@ -44,6 +48,8 @@ from sklearn.metrics import (
     roc_auc_score,
     f1_score,
     accuracy_score,
+    confusion_matrix,
+    roc_curve,
 )
 
 warnings.filterwarnings("ignore")
@@ -169,7 +175,7 @@ def patient_stratified_split(
     return tr, vl, te
 
 
-# ==================== TRANSFORMS ====================
+# ==================== SELF-DEFINED TRANSFORMS ====================
 class FovMaskd(MapTransform):
     """Zero out pixels outside the circular fundus FOV."""
 
@@ -213,7 +219,8 @@ class FovMaskd(MapTransform):
 class CLAHEd(MapTransform):
     """
     Per-channel CLAHE to boost disc interior contrast.
-    cv2.CLAHE is created inside __call__ (not __init__) to stay picklable
+    cv2.CLAHE is created inside __call__ as a local variable (NOT self.clahe)
+    so the object is never stored on the instance and stays picklable
     across DataLoader worker processes.
     """
 
@@ -224,13 +231,11 @@ class CLAHEd(MapTransform):
         tile_grid_size: tuple = (8, 8),
     ):
         super().__init__(keys)
-        # store only plain Python types — picklable by DataLoader workers
         self.clip_limit = clip_limit
         self.tile_grid_size = tile_grid_size
-        # do NOT call cv2.createCLAHE() here
 
     def __call__(self, data: dict) -> dict:
-        # create fresh each call — cheap, avoids any pickle issues
+        # local variable — never assigned to self, never pickled
         clahe = cv2.createCLAHE(
             clipLimit=self.clip_limit,
             tileGridSize=self.tile_grid_size,
@@ -251,6 +256,7 @@ class CLAHEd(MapTransform):
         return d
 
 
+# ==================== TRANSFORM PIPELINES ====================
 def get_transforms(mode: str) -> Compose:
     transform_head = [
         LoadImaged(keys=["image"], image_only=True),
@@ -308,6 +314,36 @@ def get_transforms(mode: str) -> Compose:
         return Compose(transform_head + augment + transform_tail)
     else:
         return Compose(transform_head + transform_tail)
+
+
+def get_tta_transforms() -> list:
+    transform_head = [
+        LoadImaged(keys=["image"], image_only=True),
+        EnsureChannelFirstd(keys=["image"]),
+        ScaleIntensityd(keys=["image"], minv=0.0, maxv=1.0),
+        Resized(
+            keys=["image"], spatial_size=(cfg.IMG_SIZE, cfg.IMG_SIZE), mode="bicubic"
+        ),
+        FovMaskd(keys=["image"], threshold=10),
+        CLAHEd(keys=["image"], clip_limit=2.0),
+    ]
+    transform_tail = [
+        NormalizeIntensityd(
+            keys=["image"],
+            subtrahend=[0.485, 0.456, 0.406],
+            divisor=[0.229, 0.224, 0.225],
+            channel_wise=True,
+        ),
+        ToTensord(keys=["image", "label"]),
+    ]
+    augment_ls = [
+        [],
+        [Flipd(keys=["image"], spatial_axis=0)],
+        [Flipd(keys=["image"], spatial_axis=1)],
+        [Rotate90d(keys=["image"], k=1)],
+        [Rotate90d(keys=["image"], k=3)],
+    ]
+    return [Compose(transform_head + aug + transform_tail) for aug in augment_ls]
 
 
 # ==================== LOADERS ====================
@@ -512,7 +548,7 @@ def train(train_df, val_df, fold=None):
         if vl["auc"] > best_auc:
             best_auc = vl["auc"]
             torch.save(model.state_dict(), ckpt_path)
-            flag = "  ← best"
+            flag = "  <- best"
 
         print(
             f"  Ep {epoch:03d}/{cfg.EPOCHS} "
@@ -529,6 +565,79 @@ def train(train_df, val_df, fold=None):
     return model, history
 
 
+# ==================== TTA INFERENCE ====================
+@torch.no_grad()
+def tta_predict(model: GlaucomaModel, df: pd.DataFrame) -> np.ndarray:
+    model.eval()
+
+    transform_head = Compose(
+        [
+            LoadImaged(keys=["image"], image_only=True),
+            EnsureChannelFirstd(keys=["image"]),
+            ScaleIntensityd(keys=["image"], minv=0.0, maxv=1.0),
+            Resized(
+                keys=["image"],
+                spatial_size=(cfg.IMG_SIZE, cfg.IMG_SIZE),
+                mode="bicubic",
+            ),
+            FovMaskd(keys=["image"], threshold=10),
+            CLAHEd(keys=["image"], clip_limit=2.0),
+        ]
+    )
+    transform_tail = Compose(
+        [
+            NormalizeIntensityd(
+                keys=["image"],
+                subtrahend=[0.485, 0.456, 0.406],
+                divisor=[0.229, 0.224, 0.225],
+                channel_wise=True,
+            ),
+            ToTensord(keys=["image", "label"]),
+        ]
+    )
+
+    geom_passes = [
+        [],
+        [Flipd(keys=["image"], spatial_axis=0)],
+        [Flipd(keys=["image"], spatial_axis=1)],
+        [Rotate90d(keys=["image"], k=1)],
+        [Rotate90d(keys=["image"], k=3)],
+    ]
+    geom_names = ["original", "flip-V", "flip-H", "rot90", "rot270"]
+
+    head_dataset = CacheDataset(
+        data=df_to_monai_list(df),
+        transform=transform_head,
+        cache_rate=1.0,
+        num_workers=cfg.NUM_WORKERS,
+        copy_cache=False,
+    )
+    _ = [head_dataset[i] for i in range(len(head_dataset))]
+
+    all_probs = []
+    for geom, name in zip(geom_passes, geom_names):
+        pass_tfm = Compose(geom + [transform_tail]) if geom else transform_tail
+        pass_probs = []
+
+        for start in tqdm(
+            range(0, len(head_dataset), cfg.BATCH_SIZE),
+            desc=f"  TTA [{name}]",
+            leave=False,
+        ):
+            end = min(start + cfg.BATCH_SIZE, len(head_dataset))
+            imgs = torch.stack(
+                [pass_tfm(head_dataset[i])["image"] for i in range(start, end)]
+            ).to(DEVICE)
+
+            logits = model(imgs)
+            pass_probs.extend(torch.sigmoid(logits).cpu().numpy())
+
+        all_probs.append(np.array(pass_probs))
+
+    return np.mean(all_probs, axis=0)
+
+
+# ==================== PLOTS ====================
 def plot_training_curves(history: Dict, tag: str):
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     ep = range(1, len(history["train_loss"]) + 1)
@@ -556,7 +665,6 @@ def plot_training_curves(history: Dict, tag: str):
             markersize=4,
         )
 
-        # mark best val epoch
         if "auc" in vl_k:
             best_ep = int(np.argmax(history[vl_k])) + 1
             best_v = max(history[vl_k])
@@ -581,6 +689,166 @@ def plot_training_curves(history: Dict, tag: str):
     plt.show()
 
 
+def plot_confusion_matrix(
+    labels: np.ndarray,
+    preds: np.ndarray,
+    probs: np.ndarray,
+    tag: str = "test",
+):
+    cm = confusion_matrix(labels, preds)
+    tn, fp, fn, tp = cm.ravel()
+
+    # row-normalised matrix for colour scale — shows rates not raw counts
+    cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+
+    f1 = f1_score(labels, preds, average="macro")
+    auc = roc_auc_score(labels, probs)
+    sensitivity = tp / (tp + fn)
+    specificity = tn / (tn + fp)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(
+        cm_norm,
+        annot=False,  # we draw custom annotations below
+        fmt=".2f",
+        cmap="Blues",
+        vmin=0.0,
+        vmax=1.0,
+        xticklabels=cfg.CLASS_NAMES,
+        yticklabels=cfg.CLASS_NAMES,
+        linewidths=0.5,
+        ax=ax,
+    )
+
+    for i in range(2):
+        for j in range(2):
+            count = cm[i, j]
+            pct = cm_norm[i, j] * 100
+            color = "white" if cm_norm[i, j] > 0.55 else "#1a1a1a"
+            ax.text(
+                j + 0.5,
+                i + 0.5,
+                f"{count}\n({pct:.1f}%)",
+                ha="center",
+                va="center",
+                fontsize=13,
+                fontweight="bold",
+                color=color,
+            )
+
+    ax.set_xlabel("Predicted Label", fontweight="bold", fontsize=11)
+    ax.set_ylabel("True Label", fontweight="bold", fontsize=11)
+    ax.set_title("Confusion Matrix", fontweight="bold", fontsize=13)
+
+    fig.text(
+        0.5,
+        -0.04,
+        f"F1 (macro) = {f1:.4f}   |   AUC-ROC = {auc:.4f}"
+        f"   |   Sensitivity = {sensitivity:.4f}   |   Specificity = {specificity:.4f}",
+        ha="center",
+        fontsize=9,
+        color="#444",
+    )
+
+    plt.tight_layout()
+    out_path = cfg.OUTPUT_DIR / f"confusion_matrix_{tag}.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"[PLOT] Confusion matrix saved → {out_path}")
+
+
+def visualise_gradcam(model: GlaucomaModel, df: pd.DataFrame):
+    gradcam_dir = cfg.OUTPUT_DIR / "gradcam"
+    gradcam_dir.mkdir(parents=True, exist_ok=True)
+
+    tfm = get_transforms("val")
+    target_layer = model.backbone.blocks[-1]
+
+    _activations: Dict = {}
+    _gradients: Dict = {}
+
+    def forward_hook(module, input, output):
+        _activations["value"] = output.detach()  # (1, C, H', W')
+
+    def backward_hook(module, grad_in, grad_out):
+        _gradients["value"] = grad_out[0].detach()  # (1, C, H', W')
+
+    fwd_handle = target_layer.register_forward_hook(forward_hook)
+    bwd_handle = target_layer.register_full_backward_hook(backward_hook)
+
+    saved = 0
+
+    try:
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="  Grad-CAM"):
+            item = {"image": row["image_path"], "label": int(row["label"])}
+            tensor = tfm(item)["image"].unsqueeze(0).to(DEVICE)
+
+            # forward + backward
+            model.zero_grad()
+            logit = model(tensor)
+            logit.backward()
+
+            acts = _activations["value"]  # (1, C, H', W')
+            grads = _gradients["value"]  # (1, C, H', W')
+
+            # Grad-CAM weighting
+            weights = grads.mean(dim=(2, 3), keepdim=True)  # (1, C, 1, 1)
+            cam = (weights * acts).sum(dim=1).squeeze(0)  # (H', W')
+            cam = torch.clamp(cam, min=0)
+            cam -= cam.min()
+            cam /= cam.max() + 1e-8
+            saliency = cam.cpu().numpy()  # guaranteed 2-D
+
+            prob = float(torch.sigmoid(logit).detach().cpu())
+            pred_cls = cfg.CLASS_NAMES[int(prob >= 0.5)]
+            true_cls = cfg.CLASS_NAMES[int(row["label"])]
+            correct = pred_cls == true_cls
+
+            orig = np.array(
+                Image.open(row["image_path"])
+                .convert("RGB")
+                .resize((cfg.IMG_SIZE, cfg.IMG_SIZE))
+            )
+            heat = cv2.resize(saliency, (cfg.IMG_SIZE, cfg.IMG_SIZE))
+            heat = cv2.applyColorMap((heat * 255).astype(np.uint8), cv2.COLORMAP_JET)
+            heat = cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)
+            overlay = cv2.addWeighted(orig, 0.6, heat, 0.4, 0)
+
+            title_color = "#66BB6A" if correct else "#EF5350"
+
+            fig, axes = plt.subplots(1, 2, figsize=(9, 4))
+
+            axes[0].imshow(orig)
+            axes[0].set_title("Original Fundus", fontweight="bold")
+            axes[0].axis("off")
+
+            axes[1].imshow(overlay)
+            axes[1].set_title(
+                f"Grad-CAM  |  True: {true_cls}  Pred: {pred_cls} ({prob:.2f})",
+                fontweight="bold",
+                color=title_color,
+            )
+            axes[1].axis("off")
+
+            plt.suptitle(row[cfg.IMAGE_COL], fontsize=9)
+            plt.tight_layout()
+
+            stem = Path(row["image_path"]).stem
+            outcome = "correct" if correct else "wrong"
+            fname = f"{stem}__{true_cls}__{outcome}.png"
+
+            out_path = gradcam_dir / fname
+            plt.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close()
+            saved += 1
+
+    finally:
+        fwd_handle.remove()
+        bwd_handle.remove()
+
+    print(f"[Grad-CAM] Saved {saved} overlays to {gradcam_dir}/")
+
+
 # ==================== ENTRY POINT ====================
 if __name__ == "__main__":
     print("=" * 60)
@@ -598,7 +866,25 @@ if __name__ == "__main__":
     torch.save(model.state_dict(), cfg.FINAL_OUTPUT_DIR / "final_model.pt")
     json.dump(history, open(cfg.OUTPUT_DIR / "training_history.json", "w"))
 
-    # generate plots
     plot_training_curves(history, tag="final")
 
-    print(f"\n[DONE] Model and history saved to {cfg.FINAL_OUTPUT_DIR}/")
+    # ──────────── test set evaluation ────────────
+    print("\n[INFERENCE] Running TTA on test set...")
+    probs = tta_predict(model, test_df)
+    labels = test_df["label"].values
+
+    fpr, tpr, thresholds = roc_curve(labels, probs)
+    threshold = float(thresholds[np.argmax(tpr - fpr)])
+    preds = (probs >= threshold).astype(int)
+    print(f"  Optimal threshold : {threshold:.4f}")
+    print(f"  AUC-ROC           : {roc_auc_score(labels, probs):.4f}")
+    print(f"  F1 (macro)        : {f1_score(labels, preds, average='macro'):.4f}")
+    print(f"  Accuracy          : {accuracy_score(labels, preds):.4f}")
+
+    plot_confusion_matrix(labels, preds, probs, tag="final")
+
+    # ──────────── grad-cam for all test images ────────────
+    print("\n[GRAD-CAM] Generating saliency maps for all test images...")
+    visualise_gradcam(model, test_df)
+
+    print(f"\n[DONE] All outputs saved to {cfg.OUTPUT_DIR}/")
