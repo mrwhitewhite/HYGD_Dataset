@@ -2,6 +2,6 @@ data/*
 venv/*
 test.ipynb
 test.md
-outputs/*
+outputs/gradcam/*
 tmp_model/*
 */__pycache__/*
