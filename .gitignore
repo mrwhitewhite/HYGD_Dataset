@@ -4,3 +4,4 @@ test.ipynb
 test.md
 outputs/*
 tmp_model/*
+*/__pycache__/*
