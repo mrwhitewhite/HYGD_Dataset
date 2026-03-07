@@ -38,10 +38,8 @@ from monai.transforms import (
     RandAffined,
     NormalizeIntensityd,
     ToTensord,
-    MapTransform,
 )
 from monai.utils import set_determinism
-from monai.config import KeysCollection
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -175,87 +173,6 @@ def patient_stratified_split(
     return tr, vl, te
 
 
-# ==================== SELF-DEFINED TRANSFORMS ====================
-class FovMaskd(MapTransform):
-    """Zero out pixels outside the circular fundus FOV."""
-
-    def __init__(self, keys: KeysCollection, threshold: int = 15):
-        super().__init__(keys)
-        self.threshold = threshold
-
-    def __call__(self, data: dict) -> dict:
-        d = dict(data)
-        for key in self.keys:
-            img = d[key]
-            arr = img.numpy() if hasattr(img, "numpy") else np.array(img)
-            C, H, W = arr.shape
-
-            gray = (arr.mean(axis=0) * 255).astype(np.uint8)
-            _, binary = cv2.threshold(gray, self.threshold, 255, cv2.THRESH_BINARY)
-            binary = cv2.morphologyEx(
-                binary,
-                cv2.MORPH_CLOSE,
-                kernel=cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
-            )
-            contours, _ = cv2.findContours(
-                binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-
-            mask = np.zeros((H, W), dtype=np.uint8)
-            if contours:
-                largest = max(contours, key=cv2.contourArea)
-                (cx, cy), radius = cv2.minEnclosingCircle(largest)
-                cv2.circle(mask, (int(cx), int(cy)), int(radius), 255, thickness=-1)
-            else:
-                mask[:] = 255
-
-            mask_float = (mask / 255.0).astype(np.float32)
-            arr = arr * mask_float[np.newaxis, :, :]
-
-            d[key] = torch.from_numpy(arr) if hasattr(img, "numpy") else arr
-        return d
-
-
-class CLAHEd(MapTransform):
-    """
-    Per-channel CLAHE to boost disc interior contrast.
-    cv2.CLAHE is created inside __call__ as a local variable (NOT self.clahe)
-    so the object is never stored on the instance and stays picklable
-    across DataLoader worker processes.
-    """
-
-    def __init__(
-        self,
-        keys: KeysCollection,
-        clip_limit: float = 2.0,
-        tile_grid_size: tuple = (8, 8),
-    ):
-        super().__init__(keys)
-        self.clip_limit = clip_limit
-        self.tile_grid_size = tile_grid_size
-
-    def __call__(self, data: dict) -> dict:
-        # local variable — never assigned to self, never pickled
-        clahe = cv2.createCLAHE(
-            clipLimit=self.clip_limit,
-            tileGridSize=self.tile_grid_size,
-        )
-        d = dict(data)
-        for key in self.keys:
-            img = d[key]
-            is_tensor = hasattr(img, "numpy")
-            arr = img.numpy() if is_tensor else np.array(img)
-
-            arr_uint8 = (arr * 255).astype(np.uint8)
-            result = np.zeros_like(arr_uint8)
-            for c in range(arr_uint8.shape[0]):
-                result[c] = clahe.apply(arr_uint8[c])
-            arr = result.astype(np.float32) / 255.0
-
-            d[key] = torch.from_numpy(arr) if is_tensor else arr
-        return d
-
-
 # ==================== TRANSFORM PIPELINES ====================
 def get_transforms(mode: str) -> Compose:
     transform_head = [
@@ -265,8 +182,6 @@ def get_transforms(mode: str) -> Compose:
         Resized(
             keys=["image"], spatial_size=(cfg.IMG_SIZE, cfg.IMG_SIZE), mode="bicubic"
         ),
-        FovMaskd(keys=["image"], threshold=10),
-        CLAHEd(keys=["image"], clip_limit=2.0),
     ]
 
     augment = [
@@ -324,8 +239,6 @@ def get_tta_transforms() -> list:
         Resized(
             keys=["image"], spatial_size=(cfg.IMG_SIZE, cfg.IMG_SIZE), mode="bicubic"
         ),
-        FovMaskd(keys=["image"], threshold=10),
-        CLAHEd(keys=["image"], clip_limit=2.0),
     ]
     transform_tail = [
         NormalizeIntensityd(
@@ -580,8 +493,6 @@ def tta_predict(model: GlaucomaModel, df: pd.DataFrame) -> np.ndarray:
                 spatial_size=(cfg.IMG_SIZE, cfg.IMG_SIZE),
                 mode="bicubic",
             ),
-            FovMaskd(keys=["image"], threshold=10),
-            CLAHEd(keys=["image"], clip_limit=2.0),
         ]
     )
     transform_tail = Compose(
@@ -686,7 +597,6 @@ def plot_training_curves(history: Dict, tag: str):
     plt.suptitle(f"Training Curves {tag}", fontweight="bold", fontsize=13)
     plt.tight_layout()
     plt.savefig(cfg.OUTPUT_DIR / f"training_curves_{tag}.png")
-    plt.show()
 
 
 def plot_confusion_matrix(
@@ -753,7 +663,6 @@ def plot_confusion_matrix(
     plt.tight_layout()
     out_path = cfg.OUTPUT_DIR / f"confusion_matrix_{tag}.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.show()
     print(f"[PLOT] Confusion matrix saved → {out_path}")
 
 
@@ -884,7 +793,7 @@ if __name__ == "__main__":
     plot_confusion_matrix(labels, preds, probs, tag="final")
 
     # ──────────── grad-cam for all test images ────────────
-    print("\n[GRAD-CAM] Generating saliency maps for all test images...")
-    visualise_gradcam(model, test_df)
+    print("\n[GRAD-CAM] Generating saliency maps for all images...")
+    visualise_gradcam(model, df)
 
     print(f"\n[DONE] All outputs saved to {cfg.OUTPUT_DIR}/")
