@@ -1,2 +1,5 @@
 data/*
 venv/*
+test.ipynb
+test.md
+outputs/*
