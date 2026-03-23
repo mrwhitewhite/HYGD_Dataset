@@ -3,6 +3,7 @@
 Deep learning pipeline for binary classification of **Glaucomatous Optic Neuropathy (GON)** from fundus photographs, built on the [Hillel Yaffe Glaucoma Dataset v1.0.0](https://physionet.org/content/hillel-yaffe-glaucoma-dataset/1.0.0) (PhysioNet).
 
 ![Demo](image.png)
+![confusion matrix](outputs/confusion_matrix_final.png)
 
 ---
 
