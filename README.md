@@ -2,6 +2,8 @@
 
 Deep learning pipeline for binary classification of **Glaucomatous Optic Neuropathy (GON)** from fundus photographs, built on the [Hillel Yaffe Glaucoma Dataset v1.0.0](https://physionet.org/content/hillel-yaffe-glaucoma-dataset/1.0.0) (PhysioNet).
 
+![Demo](image.png)
+
 ---
 
 ## Quick Start
@@ -20,7 +22,7 @@ pip install -r requirements.txt
 ```bash
 python scripts/train.py
 ```
-> A pre-trained checkpoint is included. This step can be skipped.
+> A pre-trained checkpoint is **included**. This step can be skipped.
 
 **3. Run the GUI**
 ```bash
@@ -63,19 +65,16 @@ EfficientNet-B3 (ImageNet pre-trained, via `timm`) at native 380×380 px resolut
 
 ### Training
 - **Loss:** `BCEWithLogitsLoss` with `pos_weight = N(GON−) / N(GON+)`
-- **Sampler:** `WeightedRandomSampler` — balances class frequency per batch
+- **Sampler:** `WeightedRandomSampler`: balances class frequency per batch
 - **Optimiser:** AdamW (lr = 3×10⁻⁴, weight decay = 1×10⁻⁴)
 - **Schedule:** Cosine annealing over 40 epochs (min lr = 1×10⁻⁶)
 - **Regularisation:** Mixup (α = 0.2), gradient clipping (‖g‖₂ ≤ 1.0)
 - **Early stopping:** patience = 8 epochs on validation AUC; best checkpoint restored
 
 ### Inference
-Five-pass **Test-Time Augmentation (TTA)** — original, vertical flip, horizontal flip, 90° rotation, 270° rotation — averaged to reduce prediction variance. The preprocessing head is cached once; only the geometric variant repeats per pass.
+Five-pass **Test-Time Augmentation (TTA)**: original, vertical flip, horizontal flip, 90° rotation, 270° rotation then averaged to reduce prediction variance. The preprocessing head is cached once; only the geometric variant repeats per pass.
 
 The classification threshold is selected via **Youden's J statistic** (arg max [TPR − FPR]) rather than a fixed 0.5.
-
-### Explainability
-**Grad-CAM** saliency maps are generated for all test images using PyTorch hooks on `backbone.blocks[-1]`. Both correct and misclassified predictions are saved to `outputs/gradcam/` as `{filename}__{true_label}__{correct/wrong}.png`. Grad-CAM outputs for all test images are provided as a zip archive in `outputs/` — extract to view.
 
 ---
 
